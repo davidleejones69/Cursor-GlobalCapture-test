@@ -199,7 +199,8 @@ class GCClient:
                     rule_check,
                     is_write,
                 )
-                if resp.status_code in (429, 500, 502, 503, 504) and attempt < 5:
+                # 499 is used by some proxies/hosts as client-closed or transient; retry like 5xx.
+                if resp.status_code in (429, 499, 500, 502, 503, 504) and attempt < 8:
                     time.sleep(min(2**attempt + random.random(), 30))
                     continue
                 return resp
@@ -367,9 +368,15 @@ def select_portal_and_engine(
     if eng_override:
         pool = matching if matching else engines
         chosen = [e for e in pool if str(e.get("ID")) == str(eng_override)]
-        if not chosen:
+        if chosen:
+            matching = chosen
+        elif not engines:
+            # Engines GET failed (e.g. repeated 499); operator set GC_ENGINE_ID explicitly.
+            matching = [
+                {"ID": eng_override, "PortalID": None, "ServiceName": "GC_ENGINE_ID"}
+            ]
+        else:
             return None, engines, f"GC_ENGINE_ID={eng_override!r} not found in engines list"
-        matching = chosen
 
     if len(matching) == 0:
         # With explicit GC_PORTAL_ID, API may omit or skew PortalID on engines; if exactly
@@ -443,7 +450,9 @@ def ensure_cur_list(
         "AssemblyParameters": "",
         "Values": ["New", "Processed", "Error"],
     }
-    for path in paths:
+    # Tenants vary: create is POST .../list (singular); POST .../lists often returns 405.
+    post_paths = [f"{p}/list" for p in API_PREFIXES]
+    for path in post_paths:
         resp = client.request(
             "POST",
             path,
@@ -453,6 +462,15 @@ def ensure_cur_list(
             allow_writes=allow_writes,
         )
         if resp and resp.status_code in (200, 201, 204):
+            try:
+                j = resp.json()
+                lid = j.get("ID") or j.get("Id") or j.get("id")
+                if lid is not None:
+                    return (int(lid), "created")
+            except Exception:
+                pass
+            break
+        if resp and resp.status_code == 400 and resp.text and "already exists" in resp.text.lower():
             break
     lists2 = get_json_list(client, paths, "re-read lists after create", allow_writes)
     hit2 = find_by_name(lists2, "Name", CUR_LIST_NAME)
@@ -536,7 +554,9 @@ def ensure_cur_table(
     if not allow_writes:
         return None, "missing_readonly"
     body = {"name": CUR_TABLE_NAME, "fields": member_ids}
-    for path in [f"{p}/tablefields/" for p in API_PREFIXES]:
+    # Create is POST .../tablefield (singular); POST .../tablefields/ often returns 405 on cloud.
+    post_paths = [f"{p}/tablefield" for p in API_PREFIXES]
+    for path in post_paths:
         resp = client.request(
             "POST",
             path,
@@ -546,6 +566,15 @@ def ensure_cur_table(
             allow_writes=allow_writes,
         )
         if resp and resp.status_code in (200, 201, 204):
+            try:
+                j = resp.json()
+                tid = j.get("ID") or j.get("id")
+                if tid is not None:
+                    return (int(tid), "created")
+            except Exception:
+                pass
+            break
+        if resp and resp.status_code == 400 and resp.text and "already exists" in resp.text.lower():
             break
     rows2 = get_json_list(client, paths, "re-read table fields", allow_writes)
     hit2 = find_by_name(rows2, "name", CUR_TABLE_NAME) or find_by_name(rows2, "Name", CUR_TABLE_NAME)
@@ -604,6 +633,7 @@ def ensure_workflow(
                 return str(wid), "updated", None
         return str(wid), "update_failed", "PUT workflow not accepted; no duplicate POST attempted"
     post_paths = [f"{p}/portal/{portal_id}/workflow" for p in API_PREFIXES]
+    last_err: str | None = None
     for path in post_paths:
         resp = client.request(
             "POST",
@@ -615,10 +645,13 @@ def ensure_workflow(
         )
         if resp and resp.status_code in (200, 201, 204):
             break
+        if resp and resp.text:
+            last_err = (resp.text or "")[:500]
     wfs2 = portal_workflows(client, portal_id, allow_writes)
     hit = next((w for w in wfs2 if w.get("Name") == ALLOWED_WORKFLOW_NAME), None)
     if not hit:
-        return None, "create_failed", "POST workflow did not surface in GET list"
+        detail = last_err or "POST did not return success; check Designer (DGN) license and API path."
+        return None, "create_failed", f"Workflow not in GET list after POST. {detail}"
     wid = hit.get("ID") or hit.get("Id")
     return (str(wid) if wid else None, "created", None)
 
@@ -769,7 +802,9 @@ def run_execution(
         out["errors"].append("Preflight: portal id not in batchportals list")
         return out
     engines = discover_engines(client, allow_writes)
-    if not any(str(e.get("ID")) == str(engine_id) for e in engines):
+    engine_ok = any(str(e.get("ID")) == str(engine_id) for e in engines)
+    go_eng = os.environ.get("GC_ENGINE_ID", "").strip()
+    if not engine_ok and not (go_eng == str(engine_id) and not engines):
         out["errors"].append("Preflight: engine id not in engines list")
         return out
 
