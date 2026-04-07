@@ -1065,6 +1065,14 @@ def main() -> int:
                 indent=2,
             )
 
+    print(
+        "\n--- OPERATOR REMINDER ---\n"
+        "On single-license tenants: explicitly log out of GlobalCapture / Batch Manager (or close the client) "
+        "when you are done so the seat is freed for others. API scripts do not replace UI logout.\n"
+        "Optional: run gc_release_license.py if your server allows DELETE /license/{id} for your user.\n"
+        "---"
+    )
+
     if final == "ABORTED":
         return 2
     return 0
