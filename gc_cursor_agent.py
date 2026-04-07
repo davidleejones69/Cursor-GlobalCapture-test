@@ -26,7 +26,8 @@ except ImportError:
     sys.exit(1)
 
 ALLOWED_WORKFLOW_NAME = "Cursor - Test"
-HEURISTIC_TERMS = ("sandbox", "test", "dev", "qa")
+# Portal name substrings (case-insensitive). Includes "batch portal" for default "Batch Portal" installs.
+HEURISTIC_TERMS = ("sandbox", "test", "dev", "qa", "batch portal")
 API_PREFIXES = ("Square9CaptureAPI", "Square9CaptureApi")
 
 CUR_LIST_NAME = "CUR_Invoice Status List"
@@ -276,6 +277,25 @@ def portal_candidates(portals: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
+def _env_portal_id_override() -> tuple[int | None, str | None]:
+    """If GC_PORTAL_ID is set, use that batch portal id (explicit operator override)."""
+    raw = os.environ.get("GC_PORTAL_ID", "").strip()
+    if not raw:
+        return None, None
+    try:
+        return int(raw), None
+    except ValueError:
+        return None, f"GC_PORTAL_ID is not an integer: {raw!r}"
+
+
+def _env_engine_id_override() -> tuple[str | None, str | None]:
+    """Optional GC_ENGINE_ID when multiple engines match the portal."""
+    raw = os.environ.get("GC_ENGINE_ID", "").strip()
+    if not raw:
+        return None, None
+    return raw, None
+
+
 def discover_engines(client: GCClient, allow_writes: bool) -> list[dict[str, Any]]:
     for path in _expand_api_paths("engines"):
         resp, _ = try_paths(
@@ -300,16 +320,35 @@ def select_portal_and_engine(
     if not portals:
         return None, None, "No batch portals returned from any variant."
 
-    candidates = portal_candidates(portals)
-    if len(candidates) == 0:
-        return None, portals, "no_heuristic_match"
-    if len(candidates) > 1:
-        return None, candidates, "ambiguous_portal"
+    override_pid, override_err = _env_portal_id_override()
+    if override_err:
+        return None, None, override_err
 
-    portal = candidates[0]
-    pid = portal.get("Id") or portal.get("ID") or portal.get("id")
-    if pid is None:
-        return None, portals, "portal_missing_id"
+    if override_pid is not None:
+        portal = None
+        for p in portals:
+            raw_id = p.get("Id") or p.get("ID") or p.get("id")
+            try:
+                if raw_id is not None and int(raw_id) == override_pid:
+                    portal = p
+                    break
+            except (TypeError, ValueError):
+                continue
+        if portal is None:
+            return None, portals, f"GC_PORTAL_ID={override_pid} not found in batch portals"
+        pid = override_pid
+    else:
+        candidates = portal_candidates(portals)
+        if len(candidates) == 0:
+            return None, portals, "no_heuristic_match"
+        if len(candidates) > 1:
+            return None, candidates, "ambiguous_portal"
+
+        portal = candidates[0]
+        raw_pid = portal.get("Id") or portal.get("ID") or portal.get("id")
+        if raw_pid is None:
+            return None, portals, "portal_missing_id"
+        pid = int(raw_pid)
 
     engines = discover_engines(client, allow_writes)
     matching = []
@@ -321,8 +360,32 @@ def select_portal_and_engine(
         except (TypeError, ValueError):
             continue
 
+    eng_override, eng_err = _env_engine_id_override()
+    if eng_err:
+        return None, None, eng_err
+
+    if eng_override:
+        pool = matching if matching else engines
+        chosen = [e for e in pool if str(e.get("ID")) == str(eng_override)]
+        if not chosen:
+            return None, engines, f"GC_ENGINE_ID={eng_override!r} not found in engines list"
+        matching = chosen
+
     if len(matching) == 0:
-        return None, engines, "no_engine_for_portal"
+        # With explicit GC_PORTAL_ID, API may omit or skew PortalID on engines; if exactly
+        # one engine exists, bind to it (operator-designated batch portal still applies).
+        if override_pid is not None and len(engines) == 1:
+            matching = engines
+        else:
+            return (
+                None,
+                {
+                    "engines": engines,
+                    "portal": portal,
+                    "portal_id": pid,
+                },
+                "no_engine_for_portal",
+            )
     if len(matching) > 1:
         return None, matching, "ambiguous_engine"
 
@@ -844,8 +907,8 @@ def main() -> int:
         if err == "no_heuristic_match":
             abort_code = err
             abort_reason = (
-                "No portal name matched sandbox/test/dev/qa heuristics. "
-                "Rename a batch portal to include one of those tokens, or adjust environment."
+                "No portal name matched discovery heuristics (sandbox, test, dev, qa, batch portal). "
+                "Set GC_PORTAL_ID to a batch portal Id, or rename a portal to match a heuristic."
             )
             portal_list_abort = extra if isinstance(extra, list) else None
             decision_lines.append("No heuristic match among returned batch portals.")
@@ -868,8 +931,29 @@ def main() -> int:
             decision_lines.append("Ambiguous engines:\n" + "\n".join(lines))
         elif err == "no_engine_for_portal":
             abort_code = err
-            abort_reason = "No engine with PortalID matching the selected portal."
-            decision_lines.append(f"Engine list sample count: {len(extra or [])}")
+            eng_info = extra if isinstance(extra, dict) else {}
+            eng_list = eng_info.get("engines") or []
+            pobj = eng_info.get("portal")
+            if pobj is not None:
+                portal_id_disp = str(eng_info.get("portal_id", ""))
+                portal_name_disp = str(pobj.get("Name") or pobj.get("name") or "")
+            abort_reason = (
+                "No engine reports PortalID matching the selected batch portal, and "
+                f"{len(eng_list)} engine(s) returned (need GC_ENGINE_ID if more than one)."
+            )
+            decision_lines.append(
+                f"Selected portal id={portal_id_disp} name={portal_name_disp!r}; "
+                f"engines from API: {len(eng_list)}"
+            )
+            lines = [
+                f"{i+1}. EngineID={e.get('ID')} PortalID={e.get('PortalID')} ServiceName={e.get('ServiceName')}"
+                for i, e in enumerate(eng_list)
+            ]
+            if lines:
+                decision_lines.append("Engines:\n" + "\n".join(lines))
+            decision_lines.append(
+                "Next action: set GC_ENGINE_ID to the capture engine id that should run workflows for this portal."
+            )
         elif err:
             abort_code = err
             abort_reason = str(err)
@@ -880,14 +964,41 @@ def main() -> int:
             portal_name_disp = str(portal_engine["portal"].get("Name", ""))
             eng = portal_engine["engine"]
             engine_id_disp = str(eng.get("ID", ""))
-            engine_evidence = (
-                f"Engine ID {engine_id_disp} has PortalID={eng.get('PortalID')} "
-                f"matching selected portal {portal_id_disp}."
-            )
-            decision_lines.append(
-                f"Selected single heuristic portal '{portal_name_disp}' (id={portal_id_disp}) "
-                f"and single engine {engine_id_disp}."
-            )
+            eng_pid = eng.get("PortalID") or eng.get("PortalId") or eng.get("portalID")
+            go_eng, _ = _env_engine_id_override()
+            try:
+                natural = (
+                    eng_pid is not None
+                    and int(eng_pid) == int(portal_engine["portal_id"])
+                )
+            except (TypeError, ValueError):
+                natural = False
+            if natural:
+                engine_evidence = (
+                    f"Engine ID {engine_id_disp} has PortalID={eng_pid} "
+                    f"matching selected portal {portal_id_disp}."
+                )
+            elif go_eng:
+                engine_evidence = (
+                    f"Engine ID {engine_id_disp} selected via GC_ENGINE_ID; "
+                    f"API reports engine PortalID={eng_pid}; batch portal id={portal_id_disp}."
+                )
+            else:
+                engine_evidence = (
+                    f"Engine ID {engine_id_disp} selected as sole engine for operator-designated "
+                    f"portal {portal_id_disp}; API PortalID={eng_pid}."
+                )
+            opid, _ = _env_portal_id_override()
+            if opid is not None:
+                decision_lines.append(
+                    f"Portal id {portal_id_disp} from GC_PORTAL_ID override; "
+                    f"engine {engine_id_disp} matched PortalID."
+                )
+            else:
+                decision_lines.append(
+                    f"Selected single heuristic portal '{portal_name_disp}' (id={portal_id_disp}) "
+                    f"and single engine {engine_id_disp}."
+                )
 
     if auth_pass == "FAIL":
         abort_reason = abort_reason or "HTTP 401/403 or unreachable API (see audit failed calls)."
